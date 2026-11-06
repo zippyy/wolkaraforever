@@ -1,0 +1,118 @@
+# Validate the complete universal StikDebug handoff before exposing the arena to the guest.
+# The launcher performs the wait off the main thread; the runtime owns the breakpoint,
+# writable alias, detach and project-owned executable-memory probe.
+diff --git a/runtime/DebuggerArena.c b/runtime/DebuggerArena.c
+--- a/runtime/DebuggerArena.c
++++ b/runtime/DebuggerArena.c
+@@ -44,15 +44,31 @@ static void jit26_detach(void) {
+ }
+ #endif
+
+ // Ask whatever is attached to let go.
+ static bool da_detached(FILE *log) {
+-    if (!da_debugger_present()) return true;
++    if (!da_debugger_present()) {
++        if (log) fprintf(log, "[debugger] no debugger is attached; detach already complete\n");
++        return true;
++    }
+ #if DA_PROTOCOL
++    if (log) { fprintf(log, "[debugger] invoking JIT26Detach\n"); fflush(log); }
+     jit26_detach();
++    // JIT26Detach is the protocol handshake; allow the kernel's traced state a
++    // short interval to reflect the completed detach before making readiness
++    // decisions. This function is called by the asynchronous launcher/runtime
++    // worker, never by UIKit's main thread.
++    for (unsigned attempt = 0; attempt < 50; attempt++) {
++        if (!da_debugger_present()) {
++            if (log) fprintf(log, "[debugger] JIT26Detach completed after %u poll%s\n",
++                             attempt + 1, attempt == 0 ? "" : "s");
++            return true;
++        }
++        usleep(10 * 1000);
++    }
+ #else
+     if (log) fprintf(log, "[debugger] nothing here can ask a debugger to let go\n");
+ #endif
+     bool attached = da_debugger_present();
+-    if (log) fprintf(log, "[debugger] asked to let go; %s attached\n", attached ? "still" : "no longer");
++    if (log) fprintf(log, "[debugger] JIT26Detach result: %s attached\n", attached ? "still" : "no longer");
+     return !attached;
+ }
+@@ -66,7 +79,8 @@ bool da_request_arena(NativeCodeMemory *memory, size_t size, FILE *log) {
+     if (!da_debugger_present()) {
+         if (log) fprintf(log, "[debugger] nothing has prepared this process; not trapping\n");
+         return false;
+     }
++    if (log) { fprintf(log, "[debugger] real attachment confirmed; entering JIT26PrepareRegion\n"); fflush(log); }
+     void *executable = NULL;
+     for (unsigned attempt = 0; attempt < 3 && !executable; attempt++) {
+         if (attempt) usleep(50 * 1000);   // the script can be busy for a moment
+diff --git a/runtime/NativeCodeMemory.c b/runtime/NativeCodeMemory.c
+--- a/runtime/NativeCodeMemory.c
++++ b/runtime/NativeCodeMemory.c
+@@ -85,7 +85,10 @@ bool nc_adopt(NativeCodeMemory *memory, void *executable, size_t size) {
+     kern_return_t result = vm_remap(mach_task_self(), &alias, size, 0, VM_FLAGS_ANYWHERE,
+                                     mach_task_self(), (vm_address_t)executable, false,
+                                     &current, &maximum, VM_INHERIT_NONE);
+     if (result != KERN_SUCCESS) { errno = result == KERN_NO_SPACE ? ENOMEM : EACCES; return false; }
++    // The protocol requires two views. A same-address remap would leave the
++    // caller with no writable alias and must never be accepted as preparation.
++    if (alias == (vm_address_t)executable) { errno = EACCES; return false; }
+     if (mprotect((void *)alias, size, PROT_READ | PROT_WRITE)) {
+         int saved = errno; vm_deallocate(mach_task_self(), alias, size); errno = saved; return false;
+     }
+diff --git a/runtime/HostDiagnostics.c b/runtime/HostDiagnostics.c
+--- a/runtime/HostDiagnostics.c
++++ b/runtime/HostDiagnostics.c
+@@ -108,6 +108,7 @@ size_t hd_format(const HostDiagnostics *report, char *out, size_t size) {
+     if (report->code_signing_known)
+         used = append(out, size, used, "  may run unsigned code  %s (flags %#x)\n",
+                       report->debugged ? "yes, CS_DEBUGGED" : "no", report->code_signing_flags);
+     else
+         used = append(out, size, used, "  may run unsigned code  unknown\n");
++    used = append(out, size, used, "  CS_DEBUGGED alone      not executable-arena proof\n");
+     used = append(out, size, used, "\nMemory\n");
+diff --git a/runtime/NativeGuest.m b/runtime/NativeGuest.m
+--- a/runtime/NativeGuest.m
++++ b/runtime/NativeGuest.m
+@@ -142,10 +142,34 @@ bool ng_reserve_arena(FILE *log) {
+         size=size/2<smallest?smallest:size/2; size-=size%page;
+     }
+     if (!reserved_arena.published) return false;
+-    (void)da_release_debugger(&reserved_arena,log);
++    if (!da_release_debugger(&reserved_arena,log)) {
++        if (log) fprintf(log,"[native] JIT26Detach did not confirm debugger detachment; guest entry blocked\n");
++        nc_destroy(&reserved_arena);
++        errno=EPERM;
++        return false;
++    }
+-    if (hd_is_executable(reserved_arena.executable)) return true;
++    if (!hd_is_executable(reserved_arena.executable)) {
++        if (log) fprintf(log,"[native] the reserved arena did not survive the detach\n");
++        nc_destroy(&reserved_arena);
++        errno=EPERM;
++        return false;
++    }
++    // A VM_PROT_EXECUTE bit and CS_DEBUGGED are only observations. Execute a
++    // project-owned two-instruction sample through the adopted RW alias and RX
++    // view so preparation failure is separated from a later guest-loader fault.
++    FILE *probe_log=log?:stderr;
++    size_t probe_page=(size_t)getpagesize();
++    if (log) fprintf(log,"[native] validating the detached arena with the host-owned executable probe\n");
++    HPArenaResult probe=arena_execution_probe(reserved_arena.executable,
++                                              reserved_arena.writable,
++                                              probe_page,probe_log);
++    if (!probe.alias_execute || !probe.alias_rewrite) {
++        if (log) fprintf(log,"[native] executable arena probe failed: alias=%s rewrite=%s; guest entry blocked\n",
++                         probe.alias_execute?"PASS":"FAIL",probe.alias_rewrite?"PASS":"FAIL");
++        nc_destroy(&reserved_arena);
++        errno=EPERM;
++        return false;
++    }
++    if (log) fprintf(log,"[native] detached arena validation passed: RW alias and RX execution are usable\n");
++    return true;
+-    // Useless now, and there is no second chance to ask.
+-    if (log) fprintf(log,"[native] the reserved arena did not survive the detach\n");
+-    nc_destroy(&reserved_arena);
+-    return false;
+ }

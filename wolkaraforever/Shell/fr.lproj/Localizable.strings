@@ -222,6 +222,14 @@
 "shell.auth.generic" = "Le service développeur n’a pas pu préparer ce lancement, donc le jeu n’a pas été lancé. L’étape exacte est notée dans Documents/local-game-setup.txt ; rouvrez WolkaraForever pour réessayer.";
 "shell.jit.title" = "JIT non activé";
 "shell.jit.message" = "Cette app a été ouverte sans JIT. Activez le JIT avec votre outil de sideloading (comme SideStore) ou un activateur JIT comme StikDebug, puis rouvrez-la.";
+"shell.jit.stikDebug.title" = "Activer le JIT avec StikDebug";
+"shell.jit.stikDebug.message" = "WolkaraForever demandera à StikDebug de s’attacher à ce processus avec universal.js, de préparer une arène exécutable, puis de revenir ici. Le jeu ne démarre qu’après validation de l’arène et détachement du débogueur.";
+"shell.jit.stikDebug.open" = "Activer le JIT avec StikDebug";
+"shell.jit.manual" = "Attendre le JIT manuel";
+"shell.jit.waiting" = "En attente d’un débogueur JIT externe…\nGardez WolkaraForever ouverte.";
+"shell.jit.ready" = "Le JIT externe est prêt. Chargement du jeu…";
+"shell.jit.failed" = "Le JIT externe n’a pas été confirmé. Le jeu n’a pas démarré. Voir Documents/external-jit.log.";
+"shell.jit.openFailed" = "Impossible d’ouvrir StikDebug. Activez le JIT manuellement, puis réessayez.";
 "shell.checkingLoader" = "Vérification du chargeur… Aucun code d’app n’est exécuté.";
 "shell.preparingToRun" = "Préparation de l’exécution. Cela peut prendre quelques minutes. Gardez l’app ouverte.";
 "shell.settingUpMemory" = "Mise en place de %.0f Mio de mémoire d’exécution. Gardez l’app ouverte.";

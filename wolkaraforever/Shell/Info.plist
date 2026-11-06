@@ -14,6 +14,10 @@
 	<string>$(GUEST_RUNTIME)</string>
 	<key>TolkaraPreselectedExecutionMode</key>
 	<string>$(TOLKARA_MODE)</string>
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>stikdebug</string>
+	</array>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>WolkaraForever uses the microphone to turn what you say into text in the game's chat, and for in-game voice chat. Speech recognition runs on this iPad.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
