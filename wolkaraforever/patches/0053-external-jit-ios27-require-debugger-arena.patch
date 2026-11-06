@@ -21,7 +21,7 @@ diff --git a/runtime/NativeGuest.m b/runtime/NativeGuest.m
 +        if (!arena_ready) {
 +#if TARGET_OS_IOS
 +            if (@available(iOS 27.0, *)) {
-+                LOG("[native] external JIT: no debugger-prepared arena on iOS 27; refusing unsigned guest entry rather than triggering KERN_CODESIGN_ERROR\\n");
++                LOG("[native] external JIT: no debugger-prepared arena on iOS 27; refusing unsigned guest entry rather than triggering KERN_CODESIGN_ERROR\n");
 +                errno=EPERM;
 +            } else
 +#endif
