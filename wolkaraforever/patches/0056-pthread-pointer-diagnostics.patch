@@ -1,0 +1,89 @@
+# Add an opt-in boundary trace for the first invalid guest pthread pointer.
+# It preserves the host pthread call and does not inspect or alter guest data.
+diff --git a/runtime/NativeGuest.m b/runtime/NativeGuest.m
+--- a/runtime/NativeGuest.m
++++ b/runtime/NativeGuest.m
+@@ -111,5 +111,8 @@
+ } guest;
+ // The libraries the application carries, for the life of the guest.
++static bool trace_pthread;
++static atomic_uint pthread_diagnostic_calls;
++static atomic_uint tls_diagnostic_calls;
+ static GuestLinkSet carried;
+ static NativeCodeMemory external_quarantine;
+ // Prepared before the launch, while a debugger was there.
+@@ -661,8 +664,14 @@
+ static GTImage guest_tls[1+GL_MAX_LIBRARIES];
+ static size_t guest_tls_count;
+ void *guest_tlv_address(const uint64_t descriptor[3]) {
+     const char *owner;
+     void *value=gt_find(guest_tls,guest_tls_count,descriptor,&owner);
++    if (trace_pthread) {
++        unsigned call=atomic_fetch_add_explicit(&tls_diagnostic_calls,1,memory_order_relaxed)+1;
++        if (call<=32 || !value)
++            LOG("[pthread-diag] tls #%u thread=%u descriptor=%p owner=%s value=%p\n",
++                call,trace_tid(),descriptor,owner?:"(none)",value);
++    }
+     if (value) return value;
+     if (owner) LOG("[native] %s: no thread-local storage for descriptor %p\n",owner,descriptor);
+     else LOG("[native] invalid TLS descriptor %p\n",descriptor);
+@@ -763,10 +773,26 @@
+ static bool (*shader_wait_pending)(void);
+ static bool shader_pending(void) { return shader_wait_pending && shader_wait_pending(); }
+ static void pump_shader_wait(void) { CFRunLoopRunInMode(kCFRunLoopDefaultMode,.001,true); }
+ #define WAIT_TRACE_CALL(name,address,expression) \
+     unsigned tid=(trace_guest && gsv_enabled())?trace_tid():0; \
+     GWWaitRecord previous=gwt_begin(tid,name,address); \
+     int result=(expression); int code=errno; gwt_end(tid,previous); errno=code; return result
++static void trace_pthread_pointer(const char *operation, const void *pointer, const void *caller) {
++    if (!trace_pthread) return;
++    unsigned call=atomic_fetch_add_explicit(&pthread_diagnostic_calls,1,memory_order_relaxed)+1;
++    uintptr_t raw=(uintptr_t)pointer;
++    bool low=raw<0x1000;
++    // The common path is sampled; a low value is always recorded because a
++    // field load from a null guest object produces exactly this shape.
++    if (call>64 && !low) return;
++    unsigned protection=hd_protection(pointer);
++    bool in_guest=inside(pointer,sizeof(pthread_mutex_t));
++    char where[512]; describe_caller(caller,where,sizeof where);
++    LOG("[pthread-diag] %s #%u thread=%u pointer=%p protection=%#x guest-arena=%s low-pointer=%s candidate-null-field-offset=%#llx caller=%s\n",
++        operation,call,trace_tid(),pointer,protection,in_guest?"yes":"no",low?"yes":"no",
++        (unsigned long long)(low?raw:0),where);
++}
+ static int guest_mutex_lock(pthread_mutex_t *mutex) {
++    trace_pthread_pointer("pthread_mutex_lock",mutex,__builtin_return_address(0));
+     WAIT_TRACE_CALL("pthread_mutex_lock",mutex,pthread_mutex_lock(mutex));
+ }
+@@ -843,11 +843,11 @@
+         HOOK("strlen",gsv_strlen); HOOK("strnlen",gsv_strnlen);
+         HOOK("strcmp",gsv_strcmp); HOOK("strncmp",gsv_strncmp);
+         HOOK("memcmp",gsv_memcmp); HOOK("memchr",gsv_memchr); HOOK("strchr",gsv_strchr);
+-        if(trace_guest) {
+-            HOOK("pthread_mutex_lock",guest_mutex_lock);
+-            HOOK("pthread_cond_wait",guest_cond_wait); HOOK("pthread_cond_timedwait",guest_cond_timedwait);
+-            HOOK("pthread_cond_timedwait_relative_np",guest_cond_relativewait);
+-            HOOK("pthread_rwlock_rdlock",guest_rwlock_read); HOOK("pthread_rwlock_wrlock",guest_rwlock_write);
+-            HOOK("semaphore_wait",guest_semaphore_wait); HOOK("dispatch_semaphore_wait",guest_dispatch_wait);
+-        }
++    }
++    if (trace_guest || trace_pthread) {
++        HOOK("pthread_mutex_lock",guest_mutex_lock);
++        HOOK("pthread_cond_wait",guest_cond_wait); HOOK("pthread_cond_timedwait",guest_cond_timedwait);
++        HOOK("pthread_cond_timedwait_relative_np",guest_cond_relativewait);
++        HOOK("pthread_rwlock_rdlock",guest_rwlock_read); HOOK("pthread_rwlock_wrlock",guest_rwlock_write);
++        HOOK("semaphore_wait",guest_semaphore_wait); HOOK("dispatch_semaphore_wait",guest_dispatch_wait);
+     }
+@@ -1808,11 +1808,13 @@
+     trace_guest=[NSProcessInfo.processInfo.arguments containsObject:@"--trace-guest"];
+     if (trace_guest) LOG("[native] tracing failed file access, created directories, getenv, sockets and the calls dlsym hands out (--trace-guest)\n");
+     if (trace_guest) {
+         struct sigaction crash_registers={0};
+         crash_registers.sa_sigaction=guest_crash_registers;
+         crash_registers.sa_flags=SA_SIGINFO|SA_RESETHAND;
+         sigaction(SIGSEGV,&crash_registers,NULL);
+         sigaction(SIGBUS,&crash_registers,NULL);
+     }
++    trace_pthread=[NSProcessInfo.processInfo.arguments containsObject:@"--trace-pthread"];
++    if (trace_pthread) LOG("[native] pthread/TLS pointer diagnostics enabled (--trace-pthread); host calls remain unchanged\n");
+     case_insensitive_files=[NSProcessInfo.processInfo.arguments containsObject:@"--case-insensitive-files"];
+     if (case_insensitive_files) LOG("[native] file lookups retried ignoring case (--case-insensitive-files; experimental)\n");
