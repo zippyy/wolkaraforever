@@ -80,6 +80,12 @@ static NSString *const AKOwnedKeysUserInfoKey = @"usages";
 // This launch's execution mode and where it came from (logged; never a path).
 @property(nonatomic) TKExecutionMode executionMode;
 @property(nonatomic,copy) NSString *executionModeSource;
+// External JIT preparation is a host-side transaction. The wait and breakpoint
+// protocol run off the main thread; these fields are only read/written on the
+// main thread when the worker reports a result.
+@property(nonatomic,strong,nullable) TKApp *externalJITApp;
+@property(nonatomic) BOOL externalJITPreparationInFlight;
+@property(nonatomic) NSUInteger externalJITPreparationGeneration;
 #if TOLKARA_INTEGRATED_AUTH
 @property(nonatomic,strong) TKLocalAuthorization *localAuthorization;
 // A development run's startup kind, kept while this iPad's Developer service prepares.
@@ -122,8 +128,17 @@ static void PrepareLocalSigningFolder(void) {
     [NSFileManager.defaultManager createDirectoryAtPath:TKLocalSigningContainerPath(NSHomeDirectory()).stringByDeletingLastPathComponent
         withIntermediateDirectories:YES attributes:nil error:NULL];
 }
-// JIT enabled from outside, or an arena its enabler left.
-static BOOL PreparedFromOutside(void) { return hd_may_run_unsigned_code() || ng_arena_reserved(); }
+// On iOS 27, CS_DEBUGGED and VM_PROT_EXECUTE are observations, not proof that
+// the pages the guest will execute are accepted by code-signing enforcement.
+// ng_arena_reserved is true only after the StikDebug protocol, RW alias,
+// detach, and project-owned executable-memory probe have all succeeded.
+static BOOL PreparedFromOutside(void) {
+    if (ng_arena_reserved()) return YES;
+    if (@available(iOS 27.0, *)) return NO;
+    // Preserve Tolkara's pre-iOS-27 manual External JIT path. The iOS 27 path
+    // never takes this branch and therefore never trusts CS_DEBUGGED alone.
+    return hd_may_run_unsigned_code();
+}
 
 // The execution modes as the chooser shows them. The identifiers, the saved setting and
 // every log line keep the platform's own English names (TKExecutionModeName), because they
@@ -243,12 +258,129 @@ static NSString *TKModeUnavailableText(TKExecutionMode mode) {
     (void)scene;
     return UISceneWindowingControlStyle.minimalStyle;
 }
-// An enabler attaches only briefly: take its arena now.
+// An enabler attaches only briefly. The attachment wait and the protocol call
+// are deliberately off UIKit's main thread; an unserviced breakpoint must never
+// be used as a timing probe from the UI.
 - (void)reserveExecutableMemory {
-    // External JIT only: any other debugger stops at the request.
     if(self.executionMode!=TKExecutionModeExternalJIT || !TKExecutionModeAvailable(self.executionMode,NULL) ||
-       ng_arena_reserved() || !hd_debugger_attached() || !CanStartApps()) return;
-    ng_reserve_arena(NULL);
+       ng_arena_reserved() || !CanStartApps() || self.externalJITPreparationInFlight ||
+       !hd_debugger_attached()) return;
+    [self beginExternalJITPreparationForApp:nil source:@"manual launch" timeout:20.0];
+}
+
+- (void)setExternalJITStatus:(NSString *)status {
+    if (self.status) self.status.text=status;
+    self.libraryController.notice=status;
+}
+
+- (NSUInteger)beginExternalJITPreparationForApp:(TKApp *)app source:(NSString *)source timeout:(NSTimeInterval)timeout {
+    if (ng_arena_reserved()) return 0;
+    if (self.externalJITPreparationInFlight) {
+        if (app) self.externalJITApp=app;
+        return self.externalJITPreparationGeneration;
+    }
+    self.externalJITPreparationInFlight=YES;
+    self.externalJITPreparationGeneration++;
+    NSUInteger generation=self.externalJITPreparationGeneration;
+    self.externalJITApp=app;
+    [self setExternalJITStatus:WKLocalized(@"shell.jit.waiting")];
+    NSString *sourceName=[source copy];
+    unsigned polls=(unsigned)(timeout*10.0)+1;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
+        FILE *log=fopen(TKDocumentsPath(@"external-jit.log").fileSystemRepresentation,"a");
+        if (log) setvbuf(log,NULL,_IOLBF,0);
+        if (log) fprintf(log,"[external-jit] stage=wait source=%s pid=%d timeout=%.1f\n",
+                         sourceName.UTF8String,(int)getpid(),timeout);
+        BOOL attached=NO;
+        for (unsigned attempt=0;attempt<polls;attempt++) {
+            if (hd_debugger_attached()) { attached=YES; break; }
+            usleep(100*1000);
+        }
+        if (log) fprintf(log,"[external-jit] stage=attachment result=%s\n",attached?"attached":"timeout");
+        BOOL prepared=attached && ng_reserve_arena(log);
+        BOOL confirmed=prepared && ng_arena_reserved();
+        if (log) fprintf(log,"[external-jit] stage=ready prepared=%d confirmed=%d\n",(int)prepared,(int)confirmed);
+        if (log) fclose(log);
+        dispatch_async(dispatch_get_main_queue(),^{
+            if (generation!=self.externalJITPreparationGeneration) return;
+            self.externalJITPreparationInFlight=NO;
+            TKApp *launchApp=self.externalJITApp;
+            self.externalJITApp=nil;
+            if (confirmed) {
+                [self setExternalJITStatus:WKLocalized(@"shell.jit.ready")];
+                if (launchApp) [self launchExternalJITApp:launchApp];
+            } else {
+                NSString *message=WKLocalized(@"shell.jit.failed");
+                [self setExternalJITStatus:message];
+                if (launchApp) [self alert:WKLocalized(@"shell.jit.title") message:message];
+            }
+        });
+    });
+    return generation;
+}
+
+- (void)enableStikDebugForApp:(TKApp *)app {
+    NSString *bundleID=NSBundle.mainBundle.bundleIdentifier;
+    if (!bundleID.length) {
+        [self alert:WKLocalized(@"shell.jit.title") message:WKLocalized(@"shell.jit.openFailed")];
+        return;
+    }
+    NSURLComponents *components=[NSURLComponents new];
+    components.scheme=@"stikdebug";
+    components.host=@"enable-jit";
+    components.queryItems=@[
+        [NSURLQueryItem queryItemWithName:@"bundle-id" value:bundleID],
+        [NSURLQueryItem queryItemWithName:@"pid" value:[NSString stringWithFormat:@"%d",(int)getpid()]],
+        [NSURLQueryItem queryItemWithName:@"script-name" value:@"universal.js"],
+    ];
+    NSURL *url=components.URL;
+    if (!url) {
+        [self alert:WKLocalized(@"shell.jit.title") message:WKLocalized(@"shell.jit.openFailed")];
+        return;
+    }
+    NSUInteger generation=[self beginExternalJITPreparationForApp:app source:@"StikDebug universal.js" timeout:60.0];
+    FILE *log=fopen(TKDocumentsPath(@"external-jit.log").fileSystemRepresentation,"a");
+    if (log) {
+        setvbuf(log,NULL,_IOLBF,0);
+        fprintf(log,"[stikdebug] stage=request bundle-id=%s pid=%d script-name=universal.js url=%s\n",
+                bundleID.UTF8String,(int)getpid(),url.absoluteString.UTF8String);
+        fclose(log);
+    }
+    if (!generation && ng_arena_reserved()) {
+        [self launchExternalJITApp:app];
+        return;
+    }
+    [UIApplication.sharedApplication openURL:url options:@{} completionHandler:^(BOOL opened) {
+        dispatch_async(dispatch_get_main_queue(),^{
+            FILE *resultLog=fopen(TKDocumentsPath(@"external-jit.log").fileSystemRepresentation,"a");
+            if (resultLog) {
+                setvbuf(resultLog,NULL,_IOLBF,0);
+                fprintf(resultLog,"[stikdebug] stage=request-result opened=%d\n",(int)opened);
+                fclose(resultLog);
+            }
+            if (!opened && generation==self.externalJITPreparationGeneration &&
+                self.externalJITPreparationInFlight && !ng_arena_reserved()) {
+                self.externalJITPreparationGeneration++;
+                self.externalJITPreparationInFlight=NO;
+                self.externalJITApp=nil;
+                NSString *message=WKLocalized(@"shell.jit.openFailed");
+                [self setExternalJITStatus:message];
+                [self alert:WKLocalized(@"shell.jit.title") message:message];
+            }
+        });
+    }];
+}
+
+- (void)promptExternalJITForApp:(TKApp *)app {
+    UIAlertController *alert=[UIAlertController alertControllerWithTitle:WKLocalized(@"shell.jit.stikDebug.title")
+        message:WKLocalized(@"shell.jit.stikDebug.message") preferredStyle:UIAlertControllerStyleAlert];
+    __weak AKHostSceneDelegate *weakSelf=self;
+    [alert addAction:[UIAlertAction actionWithTitle:WKLocalized(@"shell.jit.stikDebug.open") style:UIAlertActionStyleDefault
+        handler:^(UIAlertAction *action) { (void)action; [weakSelf enableStikDebugForApp:app]; }]];
+    [alert addAction:[UIAlertAction actionWithTitle:WKLocalized(@"shell.jit.manual") style:UIAlertActionStyleDefault
+        handler:^(UIAlertAction *action) { (void)action; [weakSelf beginExternalJITPreparationForApp:app source:@"manual request" timeout:60.0]; }]];
+    [alert addAction:[UIAlertAction actionWithTitle:WKLocalized(@"common.cancel") style:UIAlertActionStyleCancel handler:nil]];
+    [self.window.rootViewController presentViewController:alert animated:YES completion:nil];
 }
 // The touch adapter posts this when it has created the game's own text view. That view
 // is the only thing dictation will type into, so it is registered here - where both the
@@ -954,9 +1086,11 @@ static NSString *AKAudioStateDescription(void) {
         [self alert:WKLocalized(@"shell.cannotStart.title") message:error.localizedDescription];
         return;
     }
-    // Opened without JIT: say so; the session stays usable.
+    // On iOS 27, JIT readiness means a confirmed prepared arena, not merely
+    // CS_DEBUGGED or an executable VM protection bit. Offer both the new
+    // StikDebug route and the existing manual sideload/JIT-enabler workflow.
     if(!PreparedFromOutside()) {
-        [self alert:WKLocalized(@"shell.jit.title") message:WKLocalized(@"shell.jit.message")];
+        [self promptExternalJITForApp:app];
         return;
     }
     [self endSession:[NSString stringWithFormat:WKLocalized(@"shell.session.used"),app.name]];
@@ -971,6 +1105,11 @@ static NSString *AKAudioStateDescription(void) {
     [self performSelector:@selector(startExternalJITGame) withObject:nil afterDelay:0];
 }
 - (void)startExternalJITGame {
+    if (!PreparedFromOutside()) {
+        [self refuseNativeGame:WKLocalized(@"shell.jit.failed")];
+        [self showStartStopped];
+        return;
+    }
     (void)ng_use_external_authorization();
     [self runNativeGame:YES app:self.launchingApp container:nil];
 }

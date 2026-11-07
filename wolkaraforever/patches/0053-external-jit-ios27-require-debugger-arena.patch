@@ -1,0 +1,35 @@
+# Fail closed when no debugger-prepared arena exists on iOS 27.
+# Prevents a known KERN_CODESIGN_ERROR SIGBUS while preserving earlier iOS behavior.
+# This is a diagnostic safety fix, not proof that StikDebug integration works.
+diff --git a/runtime/NativeGuest.m b/runtime/NativeGuest.m
+--- a/runtime/NativeGuest.m
++++ b/runtime/NativeGuest.m
+@@ -1736,11 +1736,23 @@
+         guest.arena=reserved_arena; reserved_arena=(NativeCodeMemory){0}; arena_ready=true;
+         LOG("[native] using the arena reserved earlier: %zu bytes\n",guest.arena.size);
+     }
+-    else if(external) {
+-        // An enabler first; otherwise an arena of our own.
+-        arena_ready=da_request_arena(&guest.arena,total,guest.log);
+-        if(!arena_ready) arena_ready=nc_create_managed(&guest.arena,total,prepare_externally,NULL,&external_quarantine);
+-    }
++    else if(external) {
++        // Prefer the debugger-prepared region, including an arena reserved while
++        // the external enabler was still attached. On iOS 27, an anonymous RX
++        // mapping is not proof that iOS will accept the code's signature.
++        arena_ready=da_request_arena(&guest.arena,total,guest.log);
++        if (!arena_ready) {
++#if TARGET_OS_IOS
++            if (@available(iOS 27.0, *)) {
++                LOG("[native] external JIT: no debugger-prepared arena on iOS 27; refusing unsigned guest entry rather than triggering KERN_CODESIGN_ERROR\n");
++                errno=EPERM;
++            } else
++#endif
++            {
++                arena_ready=nc_create_managed(&guest.arena,total,prepare_externally,NULL,&external_quarantine);
++            }
++        }
++    }
+     else
+         arena_ready=nc_create(&guest.arena,total,publish,NULL);
+     if (!arena_ready) { LOG("[native] arena preparation failed errno=%d %s; guest entry blocked\n",errno,signed_backend?error:""); goto done; }

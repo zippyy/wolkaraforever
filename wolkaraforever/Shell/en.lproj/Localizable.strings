@@ -223,6 +223,14 @@
 "shell.auth.generic" = "The developer service could not prepare this launch, so the game was not started. The exact step is written to Documents/local-game-setup.txt; reopen WolkaraForever to retry.";
 "shell.jit.title" = "JIT Not Enabled";
 "shell.jit.message" = "This app was opened without JIT. Enable JIT with your sideloading tool (such as SideStore) or a JIT enabler such as StikDebug, then open it again.";
+"shell.jit.stikDebug.title" = "Enable JIT with StikDebug";
+"shell.jit.stikDebug.message" = "WolkaraForever will ask StikDebug to attach to this process with universal.js, prepare an executable arena, and return here. The game starts only after the arena is validated and the debugger has detached.";
+"shell.jit.stikDebug.open" = "Enable JIT with StikDebug";
+"shell.jit.manual" = "Wait for manual JIT";
+"shell.jit.waiting" = "Waiting for an external JIT debugger…\nKeep WolkaraForever open.";
+"shell.jit.ready" = "External JIT is ready. Loading the game…";
+"shell.jit.failed" = "External JIT was not confirmed. The game was not started. See Documents/external-jit.log.";
+"shell.jit.openFailed" = "Could not open StikDebug. Enable JIT manually, then try again.";
 "shell.checkingLoader" = "Checking the loader… No app code is run.";
 "shell.preparingToRun" = "Preparing to run. This can take a few minutes. Keep this app open.";
 "shell.settingUpMemory" = "Setting up %.0f MiB of execution memory. Keep this app open.";

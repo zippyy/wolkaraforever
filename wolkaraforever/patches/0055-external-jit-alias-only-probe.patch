@@ -1,0 +1,190 @@
+# Keep production JIT validation on the helper-provided RX/RW pair. The full
+# arena probe remains an explicitly requested diagnostic because its direct
+# protection transitions are rejected by iOS 27 after JIT26Detach.
+diff --git a/runtime/HostExecutionProbe.h b/runtime/HostExecutionProbe.h
+--- a/runtime/HostExecutionProbe.h
++++ b/runtime/HostExecutionProbe.h
+@@ -15,13 +15,18 @@
+ HPResult host_execution_probe(HPMode mode, FILE *log);
+
+ typedef struct {
+     bool alias_execute, alias_rewrite;       // written through the RW alias, run from the RX view
++    bool executable_retained;                // RX view still has execute and no write permission
+     bool direct_rewrite;                     // the RX view made RW, written, made RX again, run
+     bool alias_after_direct;                 // then the alias again
+     int direct_errno, rwx_errno;             // mprotect errors of the direct stage and of RWX (0 if allowed)
+ } HPArenaResult;
++// Production readiness probe. It writes only through the separate writable
++// alias, executes only through the original RX view, and never changes the RX
++// view's protection. This is safe after JIT26Detach on iOS 27.
++HPArenaResult arena_alias_execution_probe(void *executable, void *writable, size_t size, FILE *log);
+ // Opt-in diagnostic on one spare page of a prepared arena (offset, page
+ // aligned): what a runtime that generates code may do there after the helper
+ // detached. Runs only our own samples; each stage is logged and flushed first,
+ // as a rejection can end the process.
+ HPArenaResult arena_execution_probe(void *executable, void *writable, size_t size, FILE *log);
+diff --git a/runtime/HostExecutionProbe.c b/runtime/HostExecutionProbe.c
+--- a/runtime/HostExecutionProbe.c
++++ b/runtime/HostExecutionProbe.c
+@@ -1,3 +1,4 @@
+ #include "HostExecutionProbe.h"
++#include "HostDiagnostics.h"
+ #include "NativeCodeMemory.h"
+ #include <errno.h>
+@@ -74,6 +74,64 @@ static int call_sample(void *code, size_t size, FILE *log, const char *stage, int expected) {
+     return value;
+ }
+
++static int call_alias_sample(void *code, size_t size, FILE *log, const char *stage, int expected) {
++    sys_icache_invalidate(code, size);
++    fprintf(log, "[arena-alias-probe] %s: calling sample, expected=%d\n", stage, expected); fflush(log);
++    int value = ((int (*)(void))code)();
++    fprintf(log, "[arena-alias-probe] %s: returned %d\n", stage, value); fflush(log);
++    return value;
++}
++
++HPArenaResult arena_alias_execution_probe(void *executable, void *writable, size_t size, FILE *log) {
++    HPArenaResult result = {0};
++    FILE *out = log ? log : stderr;
++#if defined(__aarch64__)
++    const uint32_t ret = 0xd65f03c0;
++    uint32_t sample[2] = {0x52800540, ret}; // mov w0, #42; ret
++    fprintf(out, "[arena-alias-probe] begin rx=%p rw=%p size=%zu; alias-only\n",
++            executable, writable, size); fflush(out);
++    if (!executable || !writable || executable == writable || size < sizeof sample) {
++        fprintf(out, "[arena-alias-probe] invalid RX/RW views\n"); fflush(out);
++        return result;
++    }
++    unsigned rx_before = hd_protection(executable);
++    unsigned rw_before = hd_protection(writable);
++    if (!(rx_before & VM_PROT_EXECUTE) || (rx_before & VM_PROT_WRITE) ||
++        !(rw_before & VM_PROT_WRITE)) {
++        fprintf(out, "[arena-alias-probe] invalid initial protection rx=%#x rw=%#x\n",
++                rx_before, rw_before); fflush(out);
++        return result;
++    }
++    NativeCodeMemory memory = {.executable = executable, .writable = writable,
++                               .size = size, .published = true};
++    if (!nc_write(&memory, 0, sample, sizeof sample)) {
++        fprintf(out, "[arena-alias-probe] initial alias write failed errno=%d\n", errno); fflush(out);
++        return result;
++    }
++    result.alias_execute = call_alias_sample(executable, sizeof sample, out, "alias write", 42) == 42;
++    if (!result.alias_execute) goto done;
++    sample[0] = 0x5280a720; // mov w0, #1337
++    if (!nc_write(&memory, 0, sample, sizeof sample)) {
++        fprintf(out, "[arena-alias-probe] rewrite through alias failed errno=%d\n", errno); fflush(out);
++        goto done;
++    }
++    result.alias_rewrite = call_alias_sample(executable, sizeof sample, out, "alias rewrite", 1337) == 1337;
++done:
++    {
++        unsigned rx_after = hd_protection(executable);
++        result.executable_retained = (rx_after & VM_PROT_EXECUTE) && !(rx_after & VM_PROT_WRITE);
++        fprintf(out, "[arena-alias-probe] result alias=%s rewrite=%s rx-retained=%s protection=%#x; no direct RX protection changes\n",
++                result.alias_execute ? "PASS" : "FAIL", result.alias_rewrite ? "PASS" : "FAIL",
++                result.executable_retained ? "PASS" : "FAIL", rx_after);
++        fflush(out);
++    }
++#else
++    (void)executable; (void)writable; (void)size;
++    fprintf(out, "[arena-alias-probe] unsupported host architecture; arm64 required\n"); fflush(out);
++#endif
++    return result;
++}
++
+ HPArenaResult arena_execution_probe(void *executable, void *writable, size_t size, FILE *log) {
+     HPArenaResult result = {0};
+ #if defined(__aarch64__)
+diff --git a/runtime/NativeGuest.m b/runtime/NativeGuest.m
+--- a/runtime/NativeGuest.m
++++ b/runtime/NativeGuest.m
+@@ -160,16 +160,17 @@ bool ng_reserve_arena(FILE *log) {
+     FILE *probe_log=log?:stderr;
+     size_t probe_page=(size_t)getpagesize();
+     if (log) fprintf(log,"[native] validating the detached arena with the host-owned executable probe\n");
+-    HPArenaResult probe=arena_execution_probe(reserved_arena.executable,
+-                                              reserved_arena.writable,
+-                                              probe_page,probe_log);
+-    if (!probe.alias_execute || !probe.alias_rewrite) {
+-        if (log) fprintf(log,"[native] executable arena probe failed: alias=%s rewrite=%s; guest entry blocked\n",
+-                         probe.alias_execute?"PASS":"FAIL",probe.alias_rewrite?"PASS":"FAIL");
++    HPArenaResult probe=arena_alias_execution_probe(reserved_arena.executable,
++                                                    reserved_arena.writable,
++                                                    probe_page,probe_log);
++    if (!probe.alias_execute || !probe.alias_rewrite || !probe.executable_retained) {
++        if (log) fprintf(log,"[native] non-destructive executable arena probe failed: alias=%s rewrite=%s rx-retained=%s; guest entry blocked\n",
++                         probe.alias_execute?"PASS":"FAIL",probe.alias_rewrite?"PASS":"FAIL",
++                         probe.executable_retained?"PASS":"FAIL");
+         nc_destroy(&reserved_arena);
+         errno=EPERM;
+         return false;
+     }
+-    if (log) fprintf(log,"[native] detached arena validation passed: RW alias and RX execution are usable\n");
++    if (log) fprintf(log,"[native] detached arena validation passed: RW alias and RX execution are usable; RX protection retained\n");
+     return true;
+ }
+diff --git a/tools/test_emulation.sh b/tools/test_emulation.sh
+--- a/tools/test_emulation.sh
++++ b/tools/test_emulation.sh
+@@ -105,4 +105,6 @@
+-"${CC[@]}" runtime/HostExecutionProbe.c runtime/NativeCodeMemory.c tests/test_arena_probe.c -o build/emulation/test_arena_probe
++"${CC[@]}" runtime/HostDiagnostics.c runtime/HostExecutionProbe.c runtime/NativeCodeMemory.c tests/test_arena_probe.c -o build/emulation/test_arena_probe
+ build/emulation/test_arena_probe
++"${CC[@]}" runtime/HostDiagnostics.c runtime/HostExecutionProbe.c runtime/NativeCodeMemory.c tests/test_arena_alias_probe.c -o build/emulation/test_arena_alias_probe
++build/emulation/test_arena_alias_probe
+ "${CC[@]}" runtime/DebuggerArena.c runtime/HostDiagnostics.c runtime/HostExecutionProbe.c runtime/NativeCodeMemory.c tests/test_debugger_arena.c -o build/emulation/test_debugger_arena
+ build/emulation/test_debugger_arena
+diff --git a/tests/test_arena_alias_probe.c b/tests/test_arena_alias_probe.c
+new file mode 100644
+--- /dev/null
++++ b/tests/test_arena_alias_probe.c
+@@ -0,0 +1,48 @@
++#include "HostDiagnostics.h"
++#include "HostExecutionProbe.h"
++#include <assert.h>
++#include <mach/mach.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <unistd.h>
++
++// Regression for iOS 27: the RX->RW->RX transition used by the destructive
++// probe can return EACCES after JIT26Detach and leave the production arena RW.
++// The readiness probe must use only the separate alias and leave RX intact.
++int main(void) {
++    size_t page = (size_t)getpagesize();
++    void *rx = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++    assert(rx != MAP_FAILED);
++    vm_address_t alias = 0;
++    vm_prot_t current = 0, maximum = 0;
++    assert(vm_remap(mach_task_self(), &alias, page, 0, VM_FLAGS_ANYWHERE,
++                    mach_task_self(), (vm_address_t)rx, false,
++                    &current, &maximum, VM_INHERIT_NONE) == KERN_SUCCESS);
++    assert(alias != (vm_address_t)rx);
++    assert(!mprotect(rx, page, PROT_READ | PROT_EXEC));
++    assert(!mprotect((void *)alias, page, PROT_READ | PROT_WRITE));
++    unsigned before = hd_protection(rx);
++    assert(before & VM_PROT_EXECUTE);
++    assert(!(before & VM_PROT_WRITE));
++    char *text = NULL;
++    size_t length = 0;
++    FILE *log = open_memstream(&text, &length);
++    assert(log);
++    HPArenaResult result = arena_alias_execution_probe(rx, (void *)alias, page, log);
++    assert(!fflush(log));
++    unsigned after = hd_protection(rx);
++    assert(result.alias_execute && result.alias_rewrite && result.executable_retained);
++    assert(after & VM_PROT_EXECUTE);
++    assert(!(after & VM_PROT_WRITE));
++    assert(strstr(text, "alias write: returned 42"));
++    assert(strstr(text, "alias rewrite: returned 1337"));
++    assert(strstr(text, "no direct RX protection changes"));
++    assert(!strstr(text, "direct:") && !strstr(text, "rwx:"));
++    fclose(log);
++    free(text);
++    munmap(rx, page);
++    vm_deallocate(mach_task_self(), alias, page);
++    puts("PASS: alias-only arena probe executes and rewrites through RW while RX remains executable");
++}
